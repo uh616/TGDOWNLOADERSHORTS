@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import logging
 import os
 import shutil
@@ -47,12 +46,11 @@ dp.include_router(router)
 def build_yt_dlp_opts(output_dir: Path) -> dict:
     opts: dict = {
         "outtmpl": str(output_dir / "%(title).200s.%(ext)s"),
-        # Более гибкий выбор форматов: лучшее видео+аудио или лучший доступный
-        "format": "bv*+ba/b",
-        "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        # Игнорируем глобальные конфиги yt-dlp (где может быть жёсткий format)
+        "ignoreconfig": True,
     }
 
     # Прокси (опционально)
@@ -63,26 +61,14 @@ def build_yt_dlp_opts(output_dir: Path) -> dict:
         # YTDLP_PROXY=socks5://user:pass@host:port
         opts["proxy"] = proxy
 
-    # Куки YouTube (опционально, для обхода "Sign in to confirm you’re not a bot")
-    cookies_b64 = os.getenv("YTDLP_COOKIES_B64")
-    if cookies_b64:
-        try:
-            cookies_bytes = base64.b64decode(cookies_b64)
-            cookies_path = output_dir / "youtube_cookies.txt"
-            with cookies_path.open("wb") as f:
-                f.write(cookies_bytes)
-            opts["cookiefile"] = str(cookies_path)
-        except Exception as e:
-            logger.exception("Failed to load cookies from YTDLP_COOKIES_B64: %s", e)
-
     return opts
 
 
 def _download_video_sync(url: str, output_dir: Path) -> Path:
+    # Чистое поведение yt-dlp без кук, как при ручном `yt-dlp --ignore-config URL`
     ydl_opts = build_yt_dlp_opts(output_dir)
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        # get final file path
         if "requested_downloads" in info and info["requested_downloads"]:
             filepath = info["requested_downloads"][0]["filepath"]
         else:
@@ -159,6 +145,31 @@ def _convert_audio_to_mp3_sync(input_path: Path, output_path: Path) -> None:
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def _reencode_video_to_mp4_sync(input_path: Path, output_path: Path) -> None:
+    """
+    Перекодировать любое видео в mp4 (H.264 + AAC), чтобы Telegram сразу его понимал.
+    Без изменения разрешения, только перекодирование контейнера/кодеков.
+    """
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        str(output_path),
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 async def prepare_media(path: Path) -> tuple[Path, str]:
     """
     Returns (final_path, kind) where kind is 'video' or 'audio'.
@@ -168,6 +179,11 @@ async def prepare_media(path: Path) -> tuple[Path, str]:
     loop = asyncio.get_running_loop()
     has_video = await loop.run_in_executor(None, _has_video_stream_sync, path)
     if has_video:
+        # Если это видео, но не mp4 — перекодируем в mp4
+        if path.suffix.lower() != ".mp4":
+            mp4_path = path.with_suffix(".mp4")
+            await loop.run_in_executor(None, _reencode_video_to_mp4_sync, path, mp4_path)
+            return mp4_path, "video"
         return path, "video"
 
     mp3_path = path.with_suffix(".mp3")
@@ -262,8 +278,6 @@ async def handle_video_message(message: Message) -> None:
             )
             return
 
-        await status.edit_text("Отправляю файл...")
-
         video_file = FSInputFile(path=str(final_path))
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -271,6 +285,7 @@ async def handle_video_message(message: Message) -> None:
             ]
         )
         if kind == "audio":
+            await status.edit_text("Отправляю аудио...")
             if final_path.stat().st_size > TELEGRAM_MAX_FILE_SIZE:
                 await status.edit_text("Аудио получилось больше 50 МБ, не могу отправить.")
                 return
@@ -280,9 +295,11 @@ async def handle_video_message(message: Message) -> None:
                 reply_markup=keyboard,
             )
         else:
-            await message.answer_document(
-                document=video_file,
-                caption="Готово! 🎬 Видео файлом.\nНажми на него, чтобы скачать или сохранить.",
+            await status.edit_text("Отправляю видео...")
+            await message.answer_video(
+                video=video_file,
+                caption="Готово! 🎬 Видео.\nМожно смотреть прямо в Telegram или скачать.",
+                supports_streaming=True,
                 reply_markup=keyboard,
             )
 
