@@ -47,7 +47,8 @@ dp.include_router(router)
 def build_yt_dlp_opts(output_dir: Path) -> dict:
     opts: dict = {
         "outtmpl": str(output_dir / "%(title).200s.%(ext)s"),
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        # Более гибкий выбор форматов: лучшее видео+аудио или лучший доступный
+        "format": "bv*+ba/b",
         "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
