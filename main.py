@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import logging
 import os
 import shutil
@@ -7,8 +8,15 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI
+from fastapi.responses import PlainTextResponse
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message, FSInputFile, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message,
+    FSInputFile,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import CommandStart
 from yt_dlp import YoutubeDL
@@ -37,7 +45,7 @@ dp.include_router(router)
 
 
 def build_yt_dlp_opts(output_dir: Path) -> dict:
-    return {
+    opts: dict = {
         "outtmpl": str(output_dir / "%(title).200s.%(ext)s"),
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "merge_output_format": "mp4",
@@ -45,6 +53,28 @@ def build_yt_dlp_opts(output_dir: Path) -> dict:
         "quiet": True,
         "no_warnings": True,
     }
+
+    # Прокси (опционально)
+    proxy = os.getenv("YTDLP_PROXY")
+    if proxy:
+        # Поддержка HTTP/SOCKS5 прокси, например:
+        # YTDLP_PROXY=http://user:pass@host:port
+        # YTDLP_PROXY=socks5://user:pass@host:port
+        opts["proxy"] = proxy
+
+    # Куки YouTube (опционально, для обхода "Sign in to confirm you’re not a bot")
+    cookies_b64 = os.getenv("YTDLP_COOKIES_B64")
+    if cookies_b64:
+        try:
+            cookies_bytes = base64.b64decode(cookies_b64)
+            cookies_path = output_dir / "youtube_cookies.txt"
+            with cookies_path.open("wb") as f:
+                f.write(cookies_bytes)
+            opts["cookiefile"] = str(cookies_path)
+        except Exception as e:
+            logger.exception("Failed to load cookies from YTDLP_COOKIES_B64: %s", e)
+
+    return opts
 
 
 def _download_video_sync(url: str, output_dir: Path) -> Path:
@@ -86,6 +116,62 @@ def _compress_video_sync(input_path: Path, output_path: Path) -> None:
         str(output_path),
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _has_video_stream_sync(path: Path) -> bool:
+    """
+    Returns True if ffprobe detects at least one video stream.
+    If ffprobe isn't available or fails, assume it's a video file.
+    """
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "csv=p=0",
+        str(path),
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode("utf-8", "ignore").strip()
+        return bool(out)
+    except Exception:
+        return True
+
+
+def _convert_audio_to_mp3_sync(input_path: Path, output_path: Path) -> None:
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-vn",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "192k",
+        str(output_path),
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+async def prepare_media(path: Path) -> tuple[Path, str]:
+    """
+    Returns (final_path, kind) where kind is 'video' or 'audio'.
+    - If file has no video stream -> convert to mp3 and return kind='audio'
+    - Else -> keep as video and return kind='video'
+    """
+    loop = asyncio.get_running_loop()
+    has_video = await loop.run_in_executor(None, _has_video_stream_sync, path)
+    if has_video:
+        return path, "video"
+
+    mp3_path = path.with_suffix(".mp3")
+    await loop.run_in_executor(None, _convert_audio_to_mp3_sync, path, mp3_path)
+    return mp3_path, "audio"
 
 
 async def compress_if_needed(path: Path) -> Optional[Path]:
@@ -162,7 +248,12 @@ async def handle_video_message(message: Message) -> None:
         output_dir = Path(tmp_dir)
 
         original_path = await download_video(text, output_dir)
-        final_path = await compress_if_needed(original_path)
+        prepared_path, kind = await prepare_media(original_path)
+
+        if kind == "audio":
+            final_path = prepared_path
+        else:
+            final_path = await compress_if_needed(prepared_path)
 
         if final_path is None:
             await status.edit_text(
@@ -178,11 +269,21 @@ async def handle_video_message(message: Message) -> None:
                 [InlineKeyboardButton(text="📚 Помощь", callback_data="help")]
             ]
         )
-        await message.answer_document(
-            document=video_file,
-            caption="Готово! 🎬 Ваше видеофайл.\nНажми на него, чтобы скачать или сохранить.",
-            reply_markup=keyboard,
-        )
+        if kind == "audio":
+            if final_path.stat().st_size > TELEGRAM_MAX_FILE_SIZE:
+                await status.edit_text("Аудио получилось больше 50 МБ, не могу отправить.")
+                return
+            await message.answer_audio(
+                audio=video_file,
+                caption="Готово! 🎵 Аудио в mp3.\nНажми, чтобы скачать/сохранить.",
+                reply_markup=keyboard,
+            )
+        else:
+            await message.answer_document(
+                document=video_file,
+                caption="Готово! 🎬 Видео файлом.\nНажми на него, чтобы скачать или сохранить.",
+                reply_markup=keyboard,
+            )
 
         try:
             await status.delete()
@@ -191,7 +292,14 @@ async def handle_video_message(message: Message) -> None:
 
     except Exception as e:
         logger.exception("Error while processing video: %s", e)
-        await status.edit_text("Произошла ошибка при скачивании или обработке видео.")
+        err_text = str(e)
+        if "Sign in to confirm you’re not a bot" in err_text or "confirm you're not a bot" in err_text:
+            await status.edit_text(
+                "YouTube запросил подтверждение (капча/логин) для этого видео.\n"
+                "На Render такое иногда блокируется по IP дата‑центра — попробуй другую ссылку или другой хостинг/прокси."
+            )
+        else:
+            await status.edit_text("Произошла ошибка при скачивании или обработке видео.")
     finally:
         if tmp_dir is not None:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -200,17 +308,19 @@ async def handle_video_message(message: Message) -> None:
 app = FastAPI()
 
 
-@app.get("/health")
-async def health() -> str:
-    return "OK"
+@app.api_route("/health", methods=["GET", "HEAD"])
+async def health() -> PlainTextResponse:
+    return PlainTextResponse("OK")
 
 
-@app.get("/")
-async def root() -> str:
-    return "Bot is running"
+@app.api_route("/", methods=["GET", "HEAD"])
+async def root() -> PlainTextResponse:
+    return PlainTextResponse("Bot is running")
 
 
 async def _start_bot() -> None:
+    # If webhook was ever set ранее, убираем его (для polling).
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 
