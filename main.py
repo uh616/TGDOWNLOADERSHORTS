@@ -82,14 +82,12 @@ async def download_video(url: str, output_dir: Path) -> Path:
 
 
 def _compress_video_sync(input_path: Path, output_path: Path) -> None:
-    # Simple re-encode to H.264/AAC with limited resolution to reduce size
+    # Re-encode to H.264/AAC с сохранением исходного разрешения
     cmd = [
         "ffmpeg",
         "-y",
         "-i",
         str(input_path),
-        "-vf",
-        "scale='min(1280,iw)':-2",
         "-c:v",
         "libx264",
         "-preset",
