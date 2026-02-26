@@ -81,23 +81,48 @@ async def download_video(url: str, output_dir: Path) -> Path:
     return await loop.run_in_executor(None, _download_video_sync, url, output_dir)
 
 
-def _compress_video_sync(input_path: Path, output_path: Path) -> None:
-    # Re-encode to H.264/AAC с сохранением исходного разрешения
+def _get_rotation_degrees(path: Path) -> int:
+    """Возвращает угол поворота из метаданных (0, 90, 180, 270)."""
     cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_path),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "28",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream_tags=rotate",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode("utf-8", "ignore").strip()
+        if out:
+            return int(out)
+    except Exception:
+        pass
+    return 0
+
+
+def _rotation_vf(degrees: int) -> str:
+    """Строка -vf: применить поворот и чётные размеры, чтобы в файле не было rotate — плеер Telegram не сплющивает."""
+    base = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+    if degrees == 90:
+        return "transpose=1," + base
+    if degrees == 270:
+        return "transpose=2," + base
+    if degrees == 180:
+        return "transpose=2,transpose=2," + base
+    return base
+
+
+def _compress_video_sync(input_path: Path, output_path: Path) -> None:
+    rot = _get_rotation_degrees(input_path)
+    vf = _rotation_vf(rot)
+    if rot == 0:
+        vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+    cmd = [
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
         str(output_path),
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -145,24 +170,17 @@ def _convert_audio_to_mp3_sync(input_path: Path, output_path: Path) -> None:
 
 def _reencode_video_to_mp4_sync(input_path: Path, output_path: Path) -> None:
     """
-    Перекодировать любое видео в mp4 (H.264 + AAC), чтобы Telegram сразу его понимал.
-    Без изменения разрешения, только перекодирование контейнера/кодеков.
+    Перекодировать в mp4 (H.264 + AAC). Поворот из метаданных «запекаем» в кадр,
+    чтобы плеер Telegram не сплющивал вертикальное видео.
     """
+    rot = _get_rotation_degrees(input_path)
+    vf = _rotation_vf(rot)
     cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_path),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "23",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
         str(output_path),
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
